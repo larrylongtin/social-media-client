@@ -2,6 +2,8 @@
 
 **App concept:** A single iOS/Android client that composes and sends posts to X (Twitter), Threads, Tumblr, Mastodon, and Bluesky simultaneously; mirrors likes/reposts/reactions back to the originating platform; and applies sentiment analysis to both incoming and outgoing content — warning the user before they post something that reads as bullying or hateful.
 
+**X integration approach (updated):** Rather than integrating directly against X's official pay-per-use API, the backend routes all X traffic (sending tweets, reading timeline/mentions, relaying likes/retweets) through an **existing third-party X access service** — a "proxy app" that already holds X API/developer access and exposes it over a simpler, cheaper interface. This is treated as a pluggable adapter behind the same internal fan-out/ingestion interfaces used for the other four platforms, so the choice of provider can change without touching the rest of the system. See Section 1 and Section 8 for details and provider options.
+
 ---
 
 ## 1. Feasibility & Platform API Reality Check (read this first)
@@ -10,13 +12,13 @@ Before committing to an architecture, budget for very different access models pe
 
 | Platform | API access model | Cost/limits | Notes for this app |
 |---|---|---|---|
-| **X (Twitter)** | Official API moved to **pay-per-use** in Feb 2026, no free tier for new developers. ~$0.015/post created ($0.20 if it contains a link), ~$0.005/post read, 2M reads/month cap before Enterprise pricing (~$42k/mo). Legacy Basic ($200/mo) and Pro ($5,000/mo) subscriptions still exist for grandfathered developers. | Real, ongoing operating cost, scales with users | This is the single biggest cost and risk driver for the product. Budget per-user API cost into your business model from day one, or plan to require users to bring their own X API key/subscription. |
+| **X (Twitter)** | **Not integrated directly against X's official API.** Instead, routed through an **existing third-party X app/proxy service** that already holds X developer access and re-sells it at lower, simpler rates (e.g., a "bring your own key" relay, or a flat-rate per-call reseller). This avoids standing up and maintaining your own X developer account, app review, and direct exposure to X's pay-per-use billing. | Provider-dependent — typically well below official rates (see comparison below); some providers charge a flat monthly fee, others per-call | Still a real, ongoing cost and a vendor-dependency risk (the proxy's own access could be revoked or repriced by X) — treat it as a managed dependency, not a solved problem. See Section 8 for provider comparison and selection criteria. |
 | **Threads** | Meta's official Threads API is publicly available (Graph-API style), free at the time of writing, OAuth-based, rate-limited per app/user. Recently expanded to support more post types, replies, insights, webhooks. | Free but rate-limited; subject to Meta app review | Reasonably solid for posting and reading a user's own content/replies. |
 | **Tumblr** | Official REST API (OAuth 1.0a/2.0), free, well-documented, has been stable for years. | Free, generous rate limits | Straightforward integration. |
 | **Mastodon** | Open protocol (ActivityPub) + REST API per-instance. No central authority — each server is its own OAuth provider. | Free | Requires "pick your home instance" UX and per-instance app registration flow. |
 | **Bluesky** | AT Protocol, open, free, official SDKs available; supports app passwords or OAuth. | Free, generous | Most developer-friendly of the five. |
 
-**Implication for planning:** X API costs and Threads/X's platform policy risk (both have historically restricted or banned third-party clients and aggregator-style posting tools) are the top two risks to validate before writing code. This plan treats that validation as Phase 0.
+**Implication for planning:** using an existing X app/proxy service removes the need to acquire and pay for your own official X developer access, but it introduces a **vendor dependency** in its place: the proxy's own X access can be throttled, repriced, or revoked with little notice, and X's terms of service around reselling/relaying access can change. Threads and X's general platform-policy risk toward third-party clients and aggregator-style posting tools are still the top risks to validate before writing code — this plan treats that validation, plus vendor selection for the X proxy, as Phase 0.
 
 ---
 
@@ -47,7 +49,11 @@ Before committing to an architecture, budget for very different access models pe
                                                      │
                      ┌──────────────┬────────────────┼────────────────┬──────────────┐
                      ▼              ▼                ▼                ▼              ▼
-                  X API         Threads API      Tumblr API      Mastodon API    Bluesky (AT Proto)
+              Existing X App /   Threads API      Tumblr API      Mastodon API    Bluesky (AT Proto)
+              Proxy Service
+              (3rd-party relay
+               with its own
+               X API access)
 ```
 
 **Key architectural decisions to make explicitly (and why):**
@@ -140,7 +146,8 @@ This is a distinct subsystem from the social integrations and deserves its own d
 - Versioned model, with a `model_version` recorded per classification for auditability and future re-scoring if the model improves.
 
 **7.6 Rate-limit & cost governor**
-- Given X's pay-per-use pricing, implement a per-user and global cost/rate budget with graceful degradation (e.g., queue and batch reads, cache aggressively, warn user if their usage would exceed a free-tier allowance you provide).
+- Even with X access routed through an existing proxy app rather than X's own pay-per-use billing, the proxy will impose its own rate limits and/or metered pricing. Implement a per-user and global cost/rate budget against the proxy's limits, with graceful degradation (e.g., queue and batch reads, cache aggressively, warn user if their usage would exceed the allowance your plan with the proxy provider covers).
+- Include a **provider health check and fallback plan**: monitor the proxy's uptime/error rate, and design the X adapter so a second proxy provider (or, later, a direct official-API integration) can be swapped in without touching the rest of the fan-out/ingestion pipeline.
 
 **7.7 Notification service**
 - Push notifications (APNs/FCM) for delivery failures, new high-sentiment interactions, reconnect-needed alerts.
@@ -151,13 +158,25 @@ This is a distinct subsystem from the social integrations and deserves its own d
 
 | Platform | Auth | Post creation | Reactions | Read/streaming | Key constraints |
 |---|---|---|---|---|---|
-| X | OAuth 2.0 | POST /2/tweets | POST /2/likes, /2/retweets | Pay-per-use reads, 2M/mo cap | Budget per-call cost; consider requiring power users to link their own X API key/subscription to control your COGS |
+| X | Whatever the chosen proxy app requires — typically its own API key, or an OAuth-style "connect your X account" flow the proxy hosts on your behalf | Proxy's post/create-tweet endpoint (wraps X's POST /2/tweets) | Proxy's like/retweet endpoints (wraps X's like/retweet endpoints) | Proxy-dependent — polling, webhooks, or streaming depending on provider | Vendor lock-in and dependency risk; validate the provider's own terms of service, uptime history, and what happens if X changes access terms for resellers |
 | Threads | Meta OAuth | Threads Publishing API (2-step: create container → publish) | Reply/like via API where supported | Webhooks for real-time events | Meta app review required before public launch |
 | Tumblr | OAuth 2.0 | POST /v2/blog/{blog}/posts | Like/reblog endpoints | REST polling | Stable, low risk |
 | Mastodon | Per-instance OAuth 2.0 | POST /api/v1/statuses | Favourite/reblog endpoints | Streaming API (SSE/WebSocket) per instance | Must handle arbitrary/unknown instances gracefully |
 | Bluesky | App password or OAuth | AT Protocol `com.atproto.repo.createRecord` | Like/repost as record creation | Firehose (real-time) or polling | Best DX, plan to build this integration first as your reference implementation |
 
-**Sequencing recommendation:** build Bluesky and Tumblr integrations first (simplest, most stable, free), Mastodon second (protocol complexity but free), Threads third (needs Meta app review lead time), X last (highest cost and policy risk, and the one most likely to have its access model change again — don't let it block your MVP timeline).
+**8.1 Choosing an existing X app/proxy provider**
+
+Third-party services that already hold X API access and resell it exist specifically because the official API's pay-per-use pricing is expensive for read-heavy or high-volume use cases. Evaluate candidates on:
+
+- **Read + write coverage** — this app needs both posting (write) and timeline/mention reading plus like/retweet relay (write reactions), so confirm the provider supports the full set, not just read-only scraping (some cheap providers are read-only).
+- **Per-user vs. shared-app model** — does the provider let each of *your* end users connect their own X account (so posts appear from the user's own handle), or does it operate as a single shared app? This app requires per-user posting identity, which narrows the field to providers offering user-level OAuth/connect flows, not just bulk data pulls.
+- **Pricing model** — flat per-call pricing (e.g., a flat rate per API call regardless of volume) is easier to forecast than tiered/metered plans; some providers also offer a "bring your own X API key" (BYOK) mode where you keep direct control of your own X spend while still using their unified publishing/webhook infrastructure — worth comparing both models against expected usage.
+- **Reliability and terms** — uptime track record, rate limits, and whether their access itself could be disrupted by an X policy change (this risk doesn't disappear just because you're not dealing with X directly — it just moves one layer down the stack).
+- **Data handling** — since user posts and possibly OAuth-adjacent credentials flow through the provider, confirm their data retention/security posture as part of your own privacy review (Section 10).
+
+Build the X adapter behind the same internal interface as the other four platform adapters (Section 3) so the proxy vendor can be swapped, or replaced later with direct official X API access, without changing the fan-out/ingestion/reaction-relay services.
+
+**Sequencing recommendation:** build Bluesky and Tumblr integrations first (simplest, most stable, free), Mastodon second (protocol complexity but free), Threads third (needs Meta app review lead time), X fourth via the chosen proxy provider (still has policy/vendor risk worth de-risking early, but no longer blocked on your own X developer-access approval or direct pay-per-use billing setup).
 
 ---
 
@@ -216,13 +235,13 @@ This is a distinct subsystem from the social integrations and deserves its own d
 
 | Phase | Focus | Rough duration* |
 |---|---|---|
-| 0 | Validate feasibility: confirm current X API pricing/access, Meta app review requirements for Threads, App Store/Play Store policy check for cross-posting apps; finalize architecture decisions and ADRs | 2–3 weeks |
+| 0 | Validate feasibility: select and vet an existing X app/proxy provider (coverage, pricing, reliability, terms), confirm Meta app review requirements for Threads, App Store/Play Store policy check for cross-posting apps; finalize architecture decisions and ADRs | 2–3 weeks |
 | 1 | Backend foundation: auth/token vault, data model, Bluesky + Tumblr integrations (simplest, free), basic fan-out publish | 4–6 weeks |
 | 2 | Mobile MVP: onboarding, compose screen, unified feed (Bluesky + Tumblr only), reaction relay | 4–6 weeks |
 | 3 | Sentiment pipeline: inbound classification + feed filtering, outbound bullying/hateful detector + warning modal, bias evaluation suite | 3–5 weeks (can run partly in parallel with Phase 2) |
 | 4 | Add Mastodon integration (multi-instance handling) | 2–3 weeks |
 | 5 | Add Threads integration (incl. Meta app review lead time — start this early, review can take weeks) | 3–4 weeks + review wait |
-| 6 | Add X integration + cost-governance controls | 2–3 weeks |
+| 6 | Add X integration via the chosen proxy provider + cost/rate-governance controls against the proxy's limits | 1–2 weeks (faster than a direct-API build, since app review/billing setup is handled by the provider) |
 | 7 | Hardening: security review/pen test, load testing, accessibility pass, closed beta | 3–4 weeks |
 | 8 | Store submission, launch | 1–2 weeks + review wait |
 
@@ -232,7 +251,7 @@ This is a distinct subsystem from the social integrations and deserves its own d
 
 ## 14. Key Risks to Track
 
-1. **X API cost model** — pay-per-use pricing means your COGS scale directly with usage; needs a monetization or usage-cap strategy before wide launch.
+1. **X proxy vendor dependency** — routing X access through an existing third-party app/proxy avoids direct pay-per-use billing and app-review overhead, but makes the product dependent on that vendor's continued access, pricing, and reliability; have a fallback/second-provider plan and monitor the provider's own standing with X.
 2. **Platform policy risk** — X, and to a lesser extent Threads, have histories of restricting third-party clients and auto-cross-posting tools; monitor developer terms of service continuously, not just at launch.
 3. **Sentiment model accuracy and bias** — both false positives (frustrated users, potential fairness/discrimination concerns) and false negatives (harmful content getting through) carry real cost; treat this as an ongoing evaluation program, not a one-time build.
 4. **Mastodon's fragmented instance landscape** — no single point of integration; instance-specific quirks and moderation rules will generate ongoing support load.
